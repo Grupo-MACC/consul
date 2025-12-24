@@ -9,8 +9,6 @@ services:
     environment:
       - CONSUL_BIND_INTERFACE=eth0
     command: agent -server -ui -node=server-1 -bootstrap-expect=1 -client=0.0.0.0 -bind=0.0.0.0
-    networks:
-      - n1
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "consul", "version"]
