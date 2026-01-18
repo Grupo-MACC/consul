@@ -13,7 +13,7 @@ ui_config {
 }
 
 client_addr = "0.0.0.0"
-bind_addr   = "0.0.0.0"
+bind_addr = "{{ GetInterfaceIP \"eth0\" }}"
 
 # IMPORTANTE:
 # - Activamos HTTPS en 8501 (lo recomendado).
