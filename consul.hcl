@@ -34,8 +34,8 @@ addresses {
 tls {
   defaults {
     ca_file   = "/consul/certs/ca.pem"
-    cert_file = "/consul/certs/consul-cert.pem"
-    key_file  = "/consul/certs/consul-key.pem"
+    cert_file = "/consul/certs/consul/consul-cert.pem"
+    key_file  = "/consul/certs/consul/consul-key.pem"
   }
 
   https {
