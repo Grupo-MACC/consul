@@ -8,6 +8,8 @@ services:
     ports:
       - "8501:8501"
       - "8600:8600/udp"
+    entrypoint: ["consul"]
+    command: ["agent", "-config-file=/consul/config/consul.hcl"]
     environment:
       CONSUL_BIND_INTERFACE: eth0
     command: >
@@ -23,3 +25,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
+    volumes:
+      - consul.hcl:/consul/config/consul.hcl:ro
+      - ./certs/ca.pem:/consul/certs/ca.pem:ro
+      - ./certs/consul/consul-cert.pem:/consul/certs/consul-cert.pem:ro
+      - ./certs/consul/consul-key.pem:/consul/certs/consul-key.pem:ro
