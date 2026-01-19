@@ -1,29 +1,37 @@
 services:
-    consul:
-        build:
-          context: .
-          dockerfile: Dockerfile
-        image: consul-tls:1.15
-        container_name: consul
-        hostname: consul
-        ports:
-          - "8501:8501"
-          - "8600:8600/udp"
-     
-        entrypoint: ["consul"]
-        command: ["agent", "-config-file=consul.hcl"]
-    
-        volumes:
-          - consul.hcl:/consul/config/consul.hcl:ro
-          - certs/ca.pem:/consul/certs/ca.pem:ro
-          - certs/consul/consul-cert.pem:/consul/certs/consul-cert.pem:ro
-          - certs/consul/consul-key.pem:/consul/certs/consul-key.pem:ro
-    
-        restart: unless-stopped
-    
-        healthcheck:
-          test: ["CMD-SHELL", "CONSUL_HTTP_ADDR=https://127.0.0.1:8501 CONSUL_CACERT=certs/ca.pem consul info >/dev/null 2>&1"]
-          interval: 10s
-          timeout: 5s
-          retries: 10
-          start_period: 10s
+  consul:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: consul-tls:1.15
+    container_name: consul
+    hostname: consul
+
+    ports:
+      - "8501:8501"
+      - "8600:8600/udp"
+      - "8600:8600/tcp"
+
+    entrypoint: ["consul"]
+    command: ["agent", "-config-file=/consul/config/consul.hcl"]
+
+    volumes:
+      - ./consul.hcl:/consul/config/consul.hcl:ro
+      - ./certs:/consul/certs:ro
+      - consul-data:/consul/data
+
+    restart: unless-stopped
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "CONSUL_HTTP_ADDR=https://127.0.0.1:8501 CONSUL_CACERT=/consul/certs/ca.pem consul info >/dev/null 2>&1"
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  consul-data:
