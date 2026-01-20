@@ -1,7 +1,34 @@
 services:
+  #region api-gateway
+  api-gateway:
+    image: haproxy:2.9
+    container_name: api_gateway
+    ports:
+      - "80:80"
+      - "443:443"
+      - "8404:8404"
+    networks:
+      n1:
+        aliases:
+          - grupo2
+    extra_hosts:
+      - "grupo2:127.0.0.1"
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - ./certs/haproxy/haproxy.pem:/usr/local/etc/haproxy/certs/haproxy.pem:ro
+      - ./certs/haproxy/haproxy-client.pem:/usr/local/etc/haproxy/certs/haproxy-client.pem:ro
+      - ./certs/ca.pem:/usr/local/etc/haproxy/certs/ca.pem:ro
+    depends_on:
+      consul:
+        condition: service_healthy
+      honeypot:
+        condition: service_started
+    restart: unless-stopped
+
+  #region consul
   consul:
     build:
-      context: .
+      context: ./consul
       dockerfile: Dockerfile
     image: consul-tls:1.15
     container_name: consul
@@ -16,8 +43,8 @@ services:
     command: ["agent", "-config-file=/consul/config/consul.hcl"]
 
     volumes:
-      - ./consul.hcl:/consul/config/consul.hcl:ro
-      - ./certs:/consul/certs:ro
+      - ./consul/consul.hcl:/consul/config/consul.hcl:ro
+      - ./certs/consul:/consul/certs/consul:ro
       - consul-data:/consul/data
 
     restart: unless-stopped
@@ -26,12 +53,40 @@ services:
       test:
         [
           "CMD-SHELL",
-          "CONSUL_HTTP_ADDR=https://127.0.0.1:8501 CONSUL_CACERT=/consul/certs/ca.pem consul info >/dev/null 2>&1"
+          "CONSUL_HTTP_ADDR=https://127.0.0.1:8501 CONSUL_CACERT=/consul/certs/consul/ca.pem consul info >/dev/null 2>&1"
         ]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 10s
+
+#region honeypot
+  honeypot:
+    build:
+      context: ./Honeypot
+      dockerfile: Dockerfile
+    container_name: honeypot
+    environment:
+      - SERVICE_ID=honeypot-1
+      - SERVICE_NAME=honeypot
+      - SERVICE_PORT=5010
+      - CONSUL_HOST=consul
+      - CONSUL_PORT=8600
+    ports:
+      - "5010:5010"
+    networks:
+      - n1
+    depends_on:
+      consul:
+        condition: service_healthy
+    volumes:
+    - ./certs/honeypot/honeypot-cert.pem:/certs/honeypot/honeypot-cert.pem:ro
+    - ./certs/honeypot/honeypot-key.pem:/certs/honeypot/honeypot-key.pem:ro
+    - ./certs/ca.pem:/certs/ca.pem:ro
+
+networks:
+  n1:
+    driver: bridge
 
 volumes:
   consul-data:

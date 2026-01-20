@@ -33,7 +33,7 @@ addresses {
 # pero SIN pedir certificado cliente (no mTLS).
 tls {
   defaults {
-    ca_file   = "/consul/certs/ca.pem"
+    ca_file   = "/consul/certs/consul/ca.pem"
     cert_file = "/consul/certs/consul/consul-cert.pem"
     key_file  = "/consul/certs/consul/consul-key.pem"
   }

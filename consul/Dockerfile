@@ -13,7 +13,7 @@ USER root
 RUN apk add --no-cache ca-certificates
 
 # Copiamos el CA al directorio estándar del sistema y actualizamos
-COPY certs/ca.pem /usr/local/share/ca-certificates/grupo2-ca.crt
+COPY ca.pem /usr/local/share/ca-certificates/grupo2-ca.crt
 RUN update-ca-certificates
 
 # Volvemos al usuario de Consul
