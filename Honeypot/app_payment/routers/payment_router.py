@@ -28,7 +28,7 @@ async def health_check():
     # else:
     #   raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Service not available")
 
-@router.get("/honey", tags=["honeypot"])
+@router.get("/pay", tags=["honeypot"])
 async def get_single_payment(
     authorization: str = Header(...), 
     db: AsyncSession = Depends(get_db)
