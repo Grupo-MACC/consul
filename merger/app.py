@@ -42,14 +42,15 @@ LOG_SHIPPER_URL = os.getenv("LOG_SHIPPER_URL", "http://log-shipper:8081")
 ADS_SERVER_URL = os.getenv("ADS_SERVER_URL", "http://ads-server:8080/predict")
 PROCESS_INTERVAL = int(os.getenv("PROCESS_INTERVAL_SECONDS", "5"))
 
+# Configuración de ventanas - AJUSTADO para detectar ataques pequeños
+WINDOW_SIZE_SECONDS = float(os.getenv("WINDOW_SIZE_SECONDS", "15"))  # Reducido de 30 a 15
+CLOSE_WINDOW_ON_IP_CHANGE = os.getenv("CLOSE_WINDOW_ON_IP_CHANGE", "true").lower() == "true"
+
 # Consul configuration (HTTPS)
 CONSUL_HOST = os.getenv("CONSUL_HOST", "10.1.11.40")
 CONSUL_PORT = os.getenv("CONSUL_PORT", "8501")
 CONSUL_SCHEME = os.getenv("CONSUL_SCHEME", "https")
 CONSUL_BASE_URL = f"{CONSUL_SCHEME}://{CONSUL_HOST}:{CONSUL_PORT}/v1"
-
-# JA3 conocido de los microservicios legítimos
-KNOWN_JA3 = "304734bb1c086c3453b387400cf83f11"
 
 # Logging
 logging.basicConfig(
@@ -180,6 +181,13 @@ class MergerState:
             "rows_sent": 0,
             "errors": 0
         }
+        # NUEVO: Tracking para cerrar ventana cuando cambia IP
+        self.last_seen_ip: Optional[str] = None
+        self.last_ip_change_time: float = 0.0
+        self.pending_window_ip: Optional[str] = None  # IP con ventana pendiente de enviar
+        # NUEVO: Tracking de última conexión para timeout de ventana
+        self.last_connection_time: float = 0.0
+        self.window_sent_for_current_ip: bool = False  # Evitar envíos duplicados
 
 state = MergerState()
 
@@ -362,22 +370,20 @@ def calculate_ja3_features(ja3: str, ip: str) -> Dict:
     # Frecuencia del JA3
     ja3_freq = state.ja3_counts.get(ja3, 0)
     
-    # Es conocido
-    ja3_is_known = 1 if ja3 == KNOWN_JA3 else 0
-    
-    # Behavior score (simplificado)
-    ja3_behavior_score = 0.5  # Base
-    if ja3 == KNOWN_JA3:
-        ja3_behavior_score = 0.5
-    elif ja3_freq == 0:
+    # Behavior score basado en frecuencia
+    if ja3_freq == 0:
         ja3_behavior_score = 0.8  # Nuevo JA3, más sospechoso
+    elif ja3_freq < 5:
+        ja3_behavior_score = 0.6
+    else:
+        ja3_behavior_score = 0.4  # JA3 frecuente, menos sospechoso
     
     # JA3 únicos desde esta IP
     unique_ja3 = len(state.ja3_by_ip.get(ip, set()))
     
     return {
         "ja3_frequency": ja3_freq,
-        "ja3_is_known": ja3_is_known,
+        "ja3_is_known": 0,  # Ya no usamos esta feature
         "ja3_behavior_score": ja3_behavior_score,
         "unique_ja3_from_ip": unique_ja3
     }
@@ -453,7 +459,7 @@ async def process_connection(conn: ZeekConnection, ssl: Optional[ZeekSSL]) -> Da
         state.all_durations.append(conn.duration)
         
         # JA3
-        ja3 = ssl.ja3 if ssl else KNOWN_JA3
+        ja3 = ssl.ja3 if ssl else ""
         if ja3:
             state.ja3_counts[ja3] = state.ja3_counts.get(ja3, 0) + 1
             if ip not in state.ja3_by_ip:
@@ -663,9 +669,9 @@ async def process_logs():
 # GENERACIÓN DE VENTANA DESLIZANTE
 # ============================================
 
-# Configuración del sliding window
+# Configuración del sliding window - usa WINDOW_SIZE_SECONDS configurable
 WINDOW_CONFIG = WindowConfig(
-    window_size_seconds=30.0,
+    window_size_seconds=WINDOW_SIZE_SECONDS,  # Configurable via env (default 15s)
     step_size_seconds=5.0,
     group_by_column='orig_h',
     timestamp_column='ts',
@@ -875,12 +881,78 @@ async def send_to_ads_server(rows: List[DatasetRow]):
 # BACKGROUND TASK
 # ============================================
 
-async def processing_loop():
-    """Loop de procesamiento en background con sliding windows"""
-    logger.info(f"Iniciando loop de procesamiento (intervalo: {PROCESS_INTERVAL}s)")
+async def check_ip_change_and_process():
+    """
+    Verifica si cambió la IP y cierra la ventana anterior.
+    Esto permite detectar patrones de ataque incluso con pocas conexiones.
+    """
+    if not state.output_buffer:
+        return
     
-    # Umbral para procesar ventanas: esperar a tener suficientes datos
-    WINDOW_PROCESSING_THRESHOLD = 10  # Procesar cuando tengamos al menos 10 conexiones
+    # Obtener la IP más reciente del buffer
+    latest_row = state.output_buffer[-1]
+    current_ip = latest_row.orig_h
+    now = time.time()
+    
+    # Actualizar tiempo de última conexión
+    state.last_connection_time = now
+    
+    # Si cambió la IP, procesar la ventana de la IP anterior
+    if CLOSE_WINDOW_ON_IP_CHANGE and state.last_seen_ip and current_ip != state.last_seen_ip:
+        logger.info(f"🔄 Cambio de IP detectado: {state.last_seen_ip} → {current_ip}")
+        
+        # Procesar ventana de la IP anterior antes de que se mezcle
+        state.pending_window_ip = state.last_seen_ip
+        await process_windows_and_send()
+        state.pending_window_ip = None
+        # Resetear flag porque hay nueva IP
+        state.window_sent_for_current_ip = False
+    
+    state.last_seen_ip = current_ip
+    state.last_ip_change_time = now
+
+
+async def check_window_timeout_and_process():
+    """
+    Verifica si pasaron 15 segundos desde la última conexión.
+    Si es así, cierra la ventana y envía a predecir.
+    """
+    if not state.output_buffer:
+        return False
+    
+    if state.last_connection_time == 0:
+        return False
+    
+    # Ya se envió la ventana para esta IP, no reenviar
+    if state.window_sent_for_current_ip:
+        return False
+    
+    now = time.time()
+    time_since_last = now - state.last_connection_time
+    
+    if time_since_last >= WINDOW_SIZE_SECONDS:
+        logger.info(f"⏱️ Timeout de ventana: {time_since_last:.1f}s >= {WINDOW_SIZE_SECONDS}s")
+        logger.info(f"   Cerrando ventana para IP: {state.last_seen_ip}")
+        
+        await process_windows_and_send()
+        
+        # Marcar que ya se envió para esta IP
+        state.window_sent_for_current_ip = True
+        return True
+    
+    return False
+
+
+async def processing_loop():
+    """Loop de procesamiento en background con sliding windows
+    
+    Lógica de ventanas:
+    - Cerrar ventana cuando pasan 15 segundos desde la última conexión de esa IP
+    - Cerrar ventana cuando llega una conexión de otra IP
+    """
+    logger.info(f"Iniciando loop de procesamiento (intervalo: {PROCESS_INTERVAL}s)")
+    logger.info(f"  Window size: {WINDOW_SIZE_SECONDS}s")
+    logger.info(f"  Close on IP change: {CLOSE_WINDOW_ON_IP_CHANGE}")
     
     loop_count = 0
     while True:
@@ -894,16 +966,21 @@ async def processing_loop():
             
             if rows_generated > 0:
                 logger.info(f"Generadas {rows_generated} filas, buffer actual: {buffer_size}")
+                # Verificar cambio de IP para cerrar ventana anterior
+                await check_ip_change_and_process()
+                # Resetear flag porque hay nueva actividad
+                state.window_sent_for_current_ip = False
             
-            # Si tenemos suficientes datos, procesar ventanas deslizantes
-            if buffer_size >= WINDOW_PROCESSING_THRESHOLD:
-                logger.info(f"🔔 Buffer tiene {buffer_size} >= {WINDOW_PROCESSING_THRESHOLD}, procesando ventanas...")
-                await process_windows_and_send()
-                
-                # Limpiar buffer viejo (mantener solo últimos 100 para próximas ventanas)
-                if buffer_size > 100:
-                    items = list(state.output_buffer)[-100:]
-                    state.output_buffer = deque(items, maxlen=1000)
+            # Verificar timeout de ventana (15 segundos sin actividad)
+            window_closed = await check_window_timeout_and_process()
+            
+            # Si se cerró ventana por timeout, limpiar buffer de esa IP
+            if window_closed and state.last_seen_ip:
+                # Limpiar conexiones de la IP procesada
+                old_size = len(state.output_buffer)
+                items = [r for r in state.output_buffer if r.orig_h != state.last_seen_ip]
+                state.output_buffer = deque(items, maxlen=1000)
+                logger.info(f"🧹 Buffer limpiado: {old_size} → {len(state.output_buffer)} filas")
                 
         except Exception as e:
             logger.error(f"Error en processing loop: {e}", exc_info=True)
