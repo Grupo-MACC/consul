@@ -93,7 +93,7 @@ services:
       - CONSUL_HOST=${CONSUL_HOST:-10.1.11.40}
       - CONSUL_PORT=${CONSUL_PORT:-8501}
     volumes:
-      - zeek_logs:/logs
+      - zeek_logs:/opt/zeek/logs
       - ./zeek/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
     restart: unless-stopped
     depends_on:
@@ -112,15 +112,15 @@ services:
       - "8082:8082"
     environment:
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
-      - ZEEK_LOGS_PATH=/zeek_logs
+      - ZEEK_LOG_DIR=/opt/zeek/logs
       - SHIPPER_DATA_PATH=/shipper_data
       - WINDOW_SIZE_SECONDS=${WINDOW_SIZE_SECONDS:-60}
-      - ADS_SERVER_URL=${ADS_SERVER_URL:-http://10.1.12.10:8080/predict}
+      - ADS_SERVER_URL=${ADS_SERVER_URL:-http://10.1.12.10:8083/predict}
       - CONSUL_HOST=${CONSUL_HOST:-10.1.11.40}
       - CONSUL_PORT=${CONSUL_PORT:-8501}
       - CONSUL_SCHEME=${CONSUL_SCHEME:-https}
     volumes:
-      - zeek_logs:/zeek_logs:ro
+      - zeek_logs:/opt/zeek/logs:ro
       - shipper_data:/shipper_data:ro
       - ./certs:/certs:ro
     networks:
