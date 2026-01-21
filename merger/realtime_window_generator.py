@@ -32,7 +32,7 @@ class WindowConfig:
     """Configuración de sliding window"""
     window_size_seconds: float = 30.0  # Tamaño de ventana
     step_size_seconds: float = 5.0      # Paso entre ventanas
-    min_connections: int = 2            # Mínimo de conexiones para crear ventana
+    min_connections: int = 1            # Mínimo de conexiones para crear ventana (antes era 2)
     
     # Features numéricas a agregar (del dataset base)
     numeric_features: List[str] = None
