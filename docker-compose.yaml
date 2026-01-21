@@ -1,4 +1,19 @@
+# =============================================================================
+# CONSUL + ADS CAPTURE STACK
+# =============================================================================
+# Stack para EC2-Consul con sistema de captura de tráfico ADS
+#
+# Componentes:
+#   - Consul: Service Discovery con HTTPS
+#   - Zeek: Captura de tráfico de red hacia Consul
+#   - Log Shipper: Recibe notificaciones de microservicios
+#   - Merger: Procesa ventanas de features y envía al ADS Server
+# =============================================================================
+
 services:
+  # ============================================
+  # CONSUL - Service Discovery con HTTPS
+  # ============================================
   consul:
     build:
       context: .
@@ -20,6 +35,10 @@ services:
       - ./certs:/consul/certs:ro
       - consul-data:/consul/data
 
+    networks:
+      consul-net:
+        ipv4_address: 172.20.0.2
+
     restart: unless-stopped
 
     healthcheck:
@@ -33,5 +52,96 @@ services:
       retries: 10
       start_period: 10s
 
+  # ============================================
+  # LOG SHIPPER - Recibe notificaciones de restart
+  # ============================================
+  log-shipper:
+    build:
+      context: ./log_shipper
+      dockerfile: Dockerfile
+    container_name: log-shipper
+    ports:
+      - "8081:8081"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+    volumes:
+      - shipper_data:/app/data
+    networks:
+      - consul-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  # ============================================
+  # ZEEK - Captura de tráfico de red
+  # ============================================
+  zeek:
+    build:
+      context: ./zeek
+      dockerfile: Dockerfile
+    container_name: zeek
+    network_mode: host
+    privileged: true
+    environment:
+      - CAPTURE_INTERFACE=${CAPTURE_INTERFACE:-ens5}
+      - CONSUL_HOST=${CONSUL_HOST:-10.1.11.40}
+      - CONSUL_PORT=${CONSUL_PORT:-8501}
+    volumes:
+      - zeek_logs:/logs
+      - ./zeek/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
+    restart: unless-stopped
+
+  # ============================================
+  # MERGER - Procesa ventanas y envía al ADS
+  # ============================================
+  merger:
+    build:
+      context: ./merger
+      dockerfile: Dockerfile
+    container_name: merger
+    ports:
+      - "8082:8082"
+    environment:
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ZEEK_LOGS_PATH=/zeek_logs
+      - SHIPPER_DATA_PATH=/shipper_data
+      - WINDOW_SIZE_SECONDS=${WINDOW_SIZE_SECONDS:-60}
+      - ADS_SERVER_URL=${ADS_SERVER_URL:-http://10.1.12.10:8080/predict}
+      - CONSUL_HOST=${CONSUL_HOST:-10.1.11.40}
+      - CONSUL_PORT=${CONSUL_PORT:-8501}
+      - CONSUL_SCHEME=${CONSUL_SCHEME:-https}
+    volumes:
+      - zeek_logs:/zeek_logs:ro
+      - shipper_data:/shipper_data:ro
+      - ./certs:/certs:ro
+    networks:
+      - consul-net
+    depends_on:
+      - log-shipper
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+# ============================================
+# VOLUMES
+# ============================================
 volumes:
   consul-data:
+  zeek_logs:
+  shipper_data:
+
+# ============================================
+# NETWORKS
+# ============================================
+networks:
+  consul-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
