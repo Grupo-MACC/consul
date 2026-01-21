@@ -73,6 +73,9 @@ services:
       interval: 10s
       timeout: 5s
       retries: 3
+    depends_on:
+      consul:
+        condition: service_healthy
     restart: unless-stopped
 
   # ============================================
@@ -93,6 +96,9 @@ services:
       - zeek_logs:/logs
       - ./zeek/local.zeek:/usr/local/zeek/share/zeek/site/local.zeek:ro
     restart: unless-stopped
+    depends_on:
+      consul:
+        condition: service_healthy
 
   # ============================================
   # MERGER - Procesa ventanas y envía al ADS
@@ -121,6 +127,7 @@ services:
       - consul-net
     depends_on:
       - log-shipper
+      - zeek
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8082/health"]
       interval: 10s
