@@ -90,23 +90,24 @@ class ConsulPoisoningPipeline:
         self.last_windows: Dict[str, Dict] = {}
         
         logger.info("ConsulPoisoningPipeline initialized")
-        logger.info(f"  Window size: {self.window_generator.config.window_size_seconds}s")
-        logger.info(f"  Step size: {self.window_generator.config.step_size_seconds}s")
+        logger.info(f"  Timeout: {self.window_generator.config.timeout_seconds}s")
+        logger.info(f"  Min connections: {self.window_generator.config.min_connections}")
     
     def process_connection(
         self, 
         zeek_conn: ZeekConnection, 
         zeek_ssl: Optional[ZeekSSL] = None
-    ) -> DatasetRow:
+    ) -> Tuple[DatasetRow, Optional[Dict]]:
         """
         Procesa una conexión y genera la fila del dataset.
+        Si cambia la IP, cierra y devuelve la ventana anterior.
         
         Args:
             zeek_conn: Conexión parseada de conn.log
             zeek_ssl: Datos SSL parseados de ssl.log (opcional)
             
         Returns:
-            DatasetRow con todas las features calculadas
+            Tupla (DatasetRow, ventana_cerrada o None)
         """
         # Generar fila con todas las features
         row = self.dataset_generator.process_connection(zeek_conn, zeek_ssl)
@@ -114,13 +115,20 @@ class ConsulPoisoningPipeline:
         # Convertir a dict para el generador de ventanas
         row_dict = row.to_dict_with_zeek_columns()
         
-        # Añadir al buffer de ventanas
-        self.window_generator.add_row(row_dict)
+        # Añadir al buffer de ventanas (puede cerrar ventana de IP anterior)
+        closed_window = self.window_generator.add_row(row_dict)
         
         self.stats['connections_processed'] += 1
         self.stats['rows_generated'] += 1
         
-        return row
+        if closed_window:
+            self.stats['windows_generated'] += 1
+            ip = closed_window.get('id.orig_h')
+            if ip:
+                self.last_windows[ip] = closed_window
+            logger.info(f"Window auto-closed for {ip} (IP change)")
+        
+        return row, closed_window
     
     def add_docker_event(self, event: DockerEvent):
         """
@@ -134,7 +142,8 @@ class ConsulPoisoningPipeline:
     
     def get_window_for_prediction(self, ip: str) -> Optional[Dict]:
         """
-        Obtiene la ventana más reciente para una IP, lista para predicción.
+        Cierra y obtiene la ventana para una IP, lista para predicción.
+        Nota: Esto cierra la ventana, no se puede volver a obtener.
         
         Args:
             ip: IP origen
@@ -147,19 +156,19 @@ class ConsulPoisoningPipeline:
         if window:
             self.stats['windows_generated'] += 1
             self.last_windows[ip] = window
-            
-            logger.debug(f"Window generated for {ip}: {window.get('n_connections')} connections")
+            logger.debug(f"Window closed for {ip}: {window.get('n_connections')} connections")
             
         return window
     
     def get_all_windows(self) -> List[Dict]:
         """
-        Genera ventanas para todas las IPs con suficientes datos.
+        Fuerza el cierre de todas las ventanas abiertas.
+        Útil al finalizar el procesamiento.
         
         Returns:
             Lista de ventanas listas para predicción
         """
-        windows = self.window_generator.generate_all_windows()
+        windows = self.window_generator.force_close_all()
         
         for w in windows:
             ip = w.get('id.orig_h')
@@ -169,9 +178,38 @@ class ConsulPoisoningPipeline:
         self.stats['windows_generated'] += len(windows)
         
         if windows:
-            logger.info(f"Generated {len(windows)} windows for prediction")
+            logger.info(f"Force-closed {len(windows)} windows")
             
         return windows
+    
+    def check_timeouts(self) -> List[Dict]:
+        """
+        Verifica timeouts y cierra ventanas inactivas (>15 segundos).
+        Debe llamarse periódicamente (ej: cada segundo).
+        
+        Returns:
+            Lista de ventanas cerradas por timeout
+        """
+        windows = self.window_generator.check_timeouts()
+        
+        for w in windows:
+            ip = w.get('id.orig_h')
+            if ip:
+                self.last_windows[ip] = w
+                logger.info(f"Window closed by timeout for {ip}")
+        
+        self.stats['windows_generated'] += len(windows)
+        
+        return windows
+    
+    def get_pending_windows(self) -> List[Dict]:
+        """
+        Obtiene ventanas pendientes de enviar al modelo.
+        
+        Returns:
+            Lista de ventanas listas
+        """
+        return self.window_generator.get_pending_windows()
     
     def prepare_for_model(
         self, 
@@ -219,13 +257,11 @@ def create_pipeline_from_env() -> ConsulPoisoningPipeline:
     """
     import os
     
-    window_size = float(os.getenv('WINDOW_SIZE_SECONDS', '30.0'))
-    step_size = float(os.getenv('WINDOW_STEP_SECONDS', '5.0'))
-    min_connections = int(os.getenv('MIN_CONNECTIONS_PER_WINDOW', '2'))
+    timeout_seconds = float(os.getenv('WINDOW_TIMEOUT_SECONDS', '15.0'))
+    min_connections = int(os.getenv('MIN_CONNECTIONS_PER_WINDOW', '1'))
     
     config = WindowConfig(
-        window_size_seconds=window_size,
-        step_size_seconds=step_size,
+        timeout_seconds=timeout_seconds,
         min_connections=min_connections
     )
     

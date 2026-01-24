@@ -42,9 +42,8 @@ LOG_SHIPPER_URL = os.getenv("LOG_SHIPPER_URL", "http://log-shipper:8081")
 ADS_SERVER_URL = os.getenv("ADS_SERVER_URL", "http://ads-server:8080/predict")
 PROCESS_INTERVAL = int(os.getenv("PROCESS_INTERVAL_SECONDS", "5"))
 
-# Configuración de ventanas - AJUSTADO para detectar ataques pequeños
-WINDOW_SIZE_SECONDS = float(os.getenv("WINDOW_SIZE_SECONDS", "15"))  # Reducido de 30 a 15
-CLOSE_WINDOW_ON_IP_CHANGE = os.getenv("CLOSE_WINDOW_ON_IP_CHANGE", "true").lower() == "true"
+# Configuración de ventanas - SIN solapamiento
+WINDOW_TIMEOUT_SECONDS = float(os.getenv("WINDOW_TIMEOUT_SECONDS", "15"))  # Timeout para cerrar ventana
 
 # Consul configuration (HTTPS)
 CONSUL_HOST = os.getenv("CONSUL_HOST", "10.1.11.40")
@@ -191,8 +190,13 @@ class MergerState:
 
 state = MergerState()
 
-# NUEVO: Pipeline realtime para generar ventanas correctas
-realtime_pipeline = ConsulPoisoningPipeline()
+# NUEVO: Pipeline realtime para generar ventanas SIN solapamiento
+from realtime_window_generator import WindowConfig as RealtimeWindowConfig
+realtime_config = RealtimeWindowConfig(
+    timeout_seconds=WINDOW_TIMEOUT_SECONDS,
+    min_connections=1
+)
+realtime_pipeline = ConsulPoisoningPipeline(realtime_config)
 
 # ============================================
 # PARSERS DE LOGS ZEEK
@@ -649,7 +653,13 @@ async def process_logs():
                 )
                 
                 # NUEVO: Usar pipeline realtime
-                row = realtime_pipeline.process_connection(new_conn)
+                # Devuelve (row, ventana_cerrada_si_cambio_ip)
+                row, closed_window = realtime_pipeline.process_connection(new_conn)
+                
+                # Si se cerró una ventana por cambio de IP, enviarla inmediatamente
+                if closed_window:
+                    logger.info(f"🔄 Ventana cerrada por cambio IP: {closed_window.get('id.orig_h')} ({closed_window.get('n_connections')} conns)")
+                    await send_window_to_ads(closed_window)
                 
                 # También mantener en buffer legacy por compatibilidad
                 state.output_buffer.append(row)
@@ -666,18 +676,19 @@ async def process_logs():
     return rows_generated
 
 # ============================================
-# GENERACIÓN DE VENTANA DESLIZANTE
+# GENERACIÓN DE VENTANA DESLIZANTE (LEGACY - solo para compatibilidad)
 # ============================================
 
-# Configuración del sliding window - usa WINDOW_SIZE_SECONDS configurable
+# NOTA: El código nuevo usa realtime_pipeline que NO tiene solapamiento
+# Este código se mantiene solo por compatibilidad con funciones legacy
 WINDOW_CONFIG = WindowConfig(
-    window_size_seconds=WINDOW_SIZE_SECONDS,  # Configurable via env (default 15s)
+    window_size_seconds=WINDOW_TIMEOUT_SECONDS,  # Usa el mismo timeout
     step_size_seconds=5.0,
     group_by_column='orig_h',
     timestamp_column='ts',
-    label_column=None,  # No tenemos labels en producción
-    numeric_columns=None,  # Auto-detect
-    categorical_columns=None,  # Auto-detect
+    label_column=None,
+    numeric_columns=None,
+    categorical_columns=None,
     numeric_aggregations=['mean', 'std', 'max', 'min']
 )
 
@@ -898,7 +909,8 @@ async def check_ip_change_and_process():
     state.last_connection_time = now
     
     # Si cambió la IP, procesar la ventana de la IP anterior
-    if CLOSE_WINDOW_ON_IP_CHANGE and state.last_seen_ip and current_ip != state.last_seen_ip:
+    # NOTA: Esto ya lo hace el realtime_pipeline automáticamente
+    if state.last_seen_ip and current_ip != state.last_seen_ip:
         logger.info(f"🔄 Cambio de IP detectado: {state.last_seen_ip} → {current_ip}")
         
         # Procesar ventana de la IP anterior antes de que se mezcle
@@ -930,8 +942,8 @@ async def check_window_timeout_and_process():
     now = time.time()
     time_since_last = now - state.last_connection_time
     
-    if time_since_last >= WINDOW_SIZE_SECONDS:
-        logger.info(f"⏱️ Timeout de ventana: {time_since_last:.1f}s >= {WINDOW_SIZE_SECONDS}s")
+    if time_since_last >= WINDOW_TIMEOUT_SECONDS:
+        logger.info(f"⏱️ Timeout de ventana: {time_since_last:.1f}s >= {WINDOW_TIMEOUT_SECONDS}s")
         logger.info(f"   Cerrando ventana para IP: {state.last_seen_ip}")
         
         await process_windows_and_send()
@@ -944,15 +956,15 @@ async def check_window_timeout_and_process():
 
 
 async def processing_loop():
-    """Loop de procesamiento en background con sliding windows
+    """Loop de procesamiento en background con ventanas SIN solapamiento
     
-    Lógica de ventanas:
-    - Cerrar ventana cuando pasan 15 segundos desde la última conexión de esa IP
-    - Cerrar ventana cuando llega una conexión de otra IP
+    Lógica de ventanas (nueva - sin solapamiento):
+    - Cerrar ventana inmediatamente cuando llega conexión de otra IP
+    - Cerrar ventana cuando pasan 15 segundos sin actividad de esa IP (timeout)
     """
     logger.info(f"Iniciando loop de procesamiento (intervalo: {PROCESS_INTERVAL}s)")
-    logger.info(f"  Window size: {WINDOW_SIZE_SECONDS}s")
-    logger.info(f"  Close on IP change: {CLOSE_WINDOW_ON_IP_CHANGE}")
+    logger.info(f"  Timeout ventanas: {realtime_pipeline.window_generator.config.timeout_seconds}s")
+    logger.info(f"  Sin solapamiento - cierre por cambio de IP o timeout")
     
     loop_count = 0
     while True:
@@ -966,21 +978,20 @@ async def processing_loop():
             
             if rows_generated > 0:
                 logger.info(f"Generadas {rows_generated} filas, buffer actual: {buffer_size}")
-                # Verificar cambio de IP para cerrar ventana anterior
-                await check_ip_change_and_process()
-                # Resetear flag porque hay nueva actividad
-                state.window_sent_for_current_ip = False
             
-            # Verificar timeout de ventana (15 segundos sin actividad)
-            window_closed = await check_window_timeout_and_process()
-            
-            # Si se cerró ventana por timeout, limpiar buffer de esa IP
-            if window_closed and state.last_seen_ip:
-                # Limpiar conexiones de la IP procesada
+            # NUEVO: Verificar timeouts de ventanas (15 segundos sin actividad)
+            timeout_windows = realtime_pipeline.check_timeouts()
+            for window in timeout_windows:
+                ip = window.get('id.orig_h', 'unknown')
+                logger.info(f"⏰ Ventana cerrada por timeout: {ip} ({window.get('n_connections')} conns)")
+                await send_window_to_ads(window)
+                
+                # Limpiar buffer legacy de esta IP
                 old_size = len(state.output_buffer)
-                items = [r for r in state.output_buffer if r.orig_h != state.last_seen_ip]
+                items = [r for r in state.output_buffer if r.orig_h != ip]
                 state.output_buffer = deque(items, maxlen=1000)
-                logger.info(f"🧹 Buffer limpiado: {old_size} → {len(state.output_buffer)} filas")
+                if old_size > len(state.output_buffer):
+                    logger.debug(f"🧹 Buffer limpiado: {old_size} → {len(state.output_buffer)} filas")
                 
         except Exception as e:
             logger.error(f"Error en processing loop: {e}", exc_info=True)

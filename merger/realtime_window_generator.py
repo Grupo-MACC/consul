@@ -5,34 +5,34 @@ Realtime Window Generator for Consul Poisoning Detection
 Transforma filas del dataset (formato dataset_10k_final.csv) a ventanas
 para el modelo de ML.
 
-Este módulo aplica sliding window sobre las filas generadas por
-RealtimeDatasetGenerator, creando ventanas con estadísticas agregadas
-que son las features que espera el modelo.
+Este módulo genera ventanas SIN solapamiento:
+- Cierra y envía la ventana cuando cambia la IP
+- Timeout de 15 segundos sin actividad → envía la ventana
 
 Flujo:
 1. Recibe filas en formato dataset_10k_final.csv
-2. Agrupa por IP y ventana temporal
-3. Calcula estadísticas (mean, std, max, min) de features clave
-4. Genera features adicionales para detección de Consul poisoning
+2. Acumula conexiones por IP
+3. Cuando cambia la IP o pasan 15s sin actividad → cierra ventana
+4. Calcula estadísticas (mean, std, max) de features clave
 5. Retorna ventana lista para el modelo
 """
 
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Deque
+from typing import Dict, List, Optional, Deque, Tuple, Callable
 from collections import deque
 from dataclasses import dataclass, asdict
 import logging
+import time
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class WindowConfig:
-    """Configuración de sliding window"""
-    window_size_seconds: float = 30.0  # Tamaño de ventana
-    step_size_seconds: float = 5.0      # Paso entre ventanas
-    min_connections: int = 1            # Mínimo de conexiones para crear ventana (antes era 2)
+    """Configuración de ventanas (sin solapamiento)"""
+    timeout_seconds: float = 15.0       # Timeout para cerrar ventana sin actividad
+    min_connections: int = 1            # Mínimo de conexiones para crear ventana
     
     # Features numéricas a agregar (del dataset base)
     numeric_features: List[str] = None
@@ -76,62 +76,106 @@ class WindowConfig:
 
 class RealtimeWindowGenerator:
     """
-    Genera ventanas deslizantes en tiempo real.
+    Genera ventanas en tiempo real SIN solapamiento.
     
-    Mantiene un buffer de filas y genera ventanas cuando hay suficientes datos.
+    Reglas de cierre de ventana:
+    1. Cuando llega una fila de una IP diferente a la actual → cierra ventana de IP anterior
+    2. Cuando pasan 15 segundos sin recibir filas de una IP → cierra esa ventana (timeout)
+    
     Las ventanas contienen estadísticas agregadas de las features.
     """
     
-    def __init__(self, config: Optional[WindowConfig] = None):
+    def __init__(self, config: Optional[WindowConfig] = None, 
+                 on_window_ready: Optional[Callable[[Dict], None]] = None):
         self.config = config or WindowConfig()
         
-        # Buffer de filas por IP
-        self.rows_by_ip: Dict[str, Deque[Dict]] = {}
+        # Callback cuando una ventana está lista para enviar al modelo
+        self.on_window_ready = on_window_ready
+        
+        # Buffer de filas por IP (ventana actual de cada IP)
+        self.rows_by_ip: Dict[str, List[Dict]] = {}
+        
+        # Timestamp de última fila recibida por IP
+        self.last_activity_by_ip: Dict[str, float] = {}
+        
+        # IP de la última fila recibida (para detectar cambio de IP)
+        self.last_ip: Optional[str] = None
         
         # Últimas ventanas generadas (para visualización/debug)
         self.recent_windows: Deque[Dict] = deque(maxlen=100)
         
+        # Cola de ventanas listas para enviar
+        self.pending_windows: Deque[Dict] = deque()
+        
         # Stats
         self.stats = {
             'windows_generated': 0,
+            'windows_by_ip_change': 0,
+            'windows_by_timeout': 0,
             'rows_processed': 0
         }
     
-    def add_row(self, row: Dict):
+    def add_row(self, row: Dict) -> Optional[Dict]:
         """
         Añade una fila al buffer.
+        Si cambia la IP, cierra la ventana de la IP anterior.
         
         Args:
             row: Diccionario con features (formato dataset_10k_final.csv)
+            
+        Returns:
+            Ventana cerrada si hubo cambio de IP, None en caso contrario
         """
         # Obtener IP (puede venir como orig_h o id.orig_h)
         ip = row.get('id.orig_h') or row.get('orig_h')
         if not ip:
             logger.warning("Fila sin IP, ignorando")
-            return
+            return None
         
         # Normalizar nombre de columna IP
         if 'orig_h' in row and 'id.orig_h' not in row:
             row['id.orig_h'] = row['orig_h']
         
-        # Añadir al buffer de esta IP
-        if ip not in self.rows_by_ip:
-            self.rows_by_ip[ip] = deque(maxlen=500)
+        current_time = time.time()
+        closed_window = None
         
+        # Si cambia la IP, cerrar ventana de la IP anterior
+        if self.last_ip is not None and self.last_ip != ip:
+            closed_window = self._close_window_for_ip(self.last_ip, reason="ip_change")
+        
+        # Inicializar buffer para esta IP si no existe
+        if ip not in self.rows_by_ip:
+            self.rows_by_ip[ip] = []
+        
+        # Añadir fila al buffer
         self.rows_by_ip[ip].append(row)
+        self.last_activity_by_ip[ip] = current_time
+        self.last_ip = ip
         self.stats['rows_processed'] += 1
+        
+        return closed_window
     
-    def add_rows(self, rows: List[Dict]):
-        """Añade múltiples filas al buffer"""
-        for row in rows:
-            self.add_row(row)
-    
-    def generate_window_for_ip(self, ip: str) -> Optional[Dict]:
+    def add_rows(self, rows: List[Dict]) -> List[Dict]:
         """
-        Genera la ventana más reciente para una IP.
+        Añade múltiples filas al buffer.
+        
+        Returns:
+            Lista de ventanas cerradas por cambio de IP
+        """
+        closed_windows = []
+        for row in rows:
+            window = self.add_row(row)
+            if window:
+                closed_windows.append(window)
+        return closed_windows
+    
+    def _close_window_for_ip(self, ip: str, reason: str = "unknown") -> Optional[Dict]:
+        """
+        Cierra la ventana de una IP y la prepara para enviar al modelo.
         
         Args:
-            ip: IP origen
+            ip: IP de la ventana a cerrar
+            reason: Motivo del cierre ("ip_change", "timeout", "manual")
             
         Returns:
             Diccionario con features agregadas de la ventana, o None si no hay suficientes datos
@@ -139,9 +183,13 @@ class RealtimeWindowGenerator:
         if ip not in self.rows_by_ip:
             return None
         
-        rows = list(self.rows_by_ip[ip])
+        rows = self.rows_by_ip[ip]
         if len(rows) < self.config.min_connections:
             logger.debug(f"IP {ip}: solo {len(rows)} filas, necesita {self.config.min_connections}")
+            # Limpiar buffer aunque no generemos ventana
+            del self.rows_by_ip[ip]
+            if ip in self.last_activity_by_ip:
+                del self.last_activity_by_ip[ip]
             return None
         
         # Convertir a DataFrame
@@ -151,47 +199,118 @@ class RealtimeWindowGenerator:
         ts_col = 'ts'
         if ts_col not in df.columns:
             logger.warning(f"No hay columna 'ts' en datos de IP {ip}")
+            del self.rows_by_ip[ip]
+            if ip in self.last_activity_by_ip:
+                del self.last_activity_by_ip[ip]
             return None
         
         df = df.sort_values(ts_col).reset_index(drop=True)
         
-        # Determinar ventana temporal (últimos N segundos)
+        min_ts = df[ts_col].min()
         max_ts = df[ts_col].max()
-        min_ts = max_ts - self.config.window_size_seconds
-        
-        # Filtrar datos en la ventana
-        window_df = df[df[ts_col] >= min_ts].copy()
-        
-        if len(window_df) < self.config.min_connections:
-            logger.debug(f"IP {ip}: ventana tiene solo {len(window_df)} filas")
-            return None
         
         # Generar agregaciones
-        window_data = self._aggregate_window(window_df, ip, min_ts, max_ts)
+        window_data = self._aggregate_window(df, ip, min_ts, max_ts)
         
         if window_data:
-            # Añadir features de Consul poisoning
-            window_data = self._add_consul_poisoning_features(window_data)
+            window_data['close_reason'] = reason
             
             # Guardar en historial
             self.recent_windows.append(window_data)
+            self.pending_windows.append(window_data)
             self.stats['windows_generated'] += 1
+            
+            if reason == "ip_change":
+                self.stats['windows_by_ip_change'] += 1
+            elif reason == "timeout":
+                self.stats['windows_by_timeout'] += 1
+            
+            # Callback si está configurado
+            if self.on_window_ready:
+                self.on_window_ready(window_data)
+            
+            logger.info(f"Ventana cerrada para IP {ip} (razón: {reason}, conexiones: {len(rows)})")
+        
+        # Limpiar buffer de esta IP
+        del self.rows_by_ip[ip]
+        if ip in self.last_activity_by_ip:
+            del self.last_activity_by_ip[ip]
         
         return window_data
     
+    def check_timeouts(self) -> List[Dict]:
+        """
+        Verifica timeouts y cierra ventanas que llevan más de 15 segundos sin actividad.
+        Debe llamarse periódicamente (ej: cada segundo).
+        
+        Returns:
+            Lista de ventanas cerradas por timeout
+        """
+        current_time = time.time()
+        closed_windows = []
+        
+        # Copiar keys para evitar modificar dict durante iteración
+        ips_to_check = list(self.last_activity_by_ip.keys())
+        
+        for ip in ips_to_check:
+            last_activity = self.last_activity_by_ip.get(ip, current_time)
+            time_since_activity = current_time - last_activity
+            
+            if time_since_activity >= self.config.timeout_seconds:
+                window = self._close_window_for_ip(ip, reason="timeout")
+                if window:
+                    closed_windows.append(window)
+        
+        return closed_windows
+    
+    def get_pending_windows(self) -> List[Dict]:
+        """
+        Obtiene y vacía la cola de ventanas pendientes.
+        
+        Returns:
+            Lista de ventanas listas para enviar al modelo
+        """
+        windows = list(self.pending_windows)
+        self.pending_windows.clear()
+        return windows
+    
+    def force_close_all(self) -> List[Dict]:
+        """
+        Fuerza el cierre de todas las ventanas abiertas.
+        Útil al finalizar el procesamiento.
+        
+        Returns:
+            Lista de todas las ventanas cerradas
+        """
+        closed_windows = []
+        for ip in list(self.rows_by_ip.keys()):
+            window = self._close_window_for_ip(ip, reason="forced")
+            if window:
+                closed_windows.append(window)
+        return closed_windows
+    
+    def generate_window_for_ip(self, ip: str) -> Optional[Dict]:
+        """
+        Cierra y genera la ventana para una IP específica.
+        Mantiene compatibilidad con código existente.
+        
+        Args:
+            ip: IP origen
+            
+        Returns:
+            Diccionario con features agregadas de la ventana, o None si no hay suficientes datos
+        """
+        return self._close_window_for_ip(ip, reason="manual")
+    
     def generate_all_windows(self) -> List[Dict]:
         """
-        Genera ventanas para todas las IPs con suficientes datos.
+        Genera ventanas para todas las IPs (fuerza cierre de todas).
+        Mantiene compatibilidad con código existente.
         
         Returns:
             Lista de ventanas generadas
         """
-        windows = []
-        for ip in list(self.rows_by_ip.keys()):
-            window = self.generate_window_for_ip(ip)
-            if window:
-                windows.append(window)
-        return windows
+        return self.force_close_all()
     
     def _aggregate_window(self, window_df: pd.DataFrame, ip: str, 
                           start_ts: float, end_ts: float) -> Dict:
@@ -297,6 +416,16 @@ class RealtimeWindowGenerator:
         """
         return window_data
     
+    def clear_old_data(self, max_age_seconds: float = 300):
+        """
+        Limpia datos antiguos del buffer (ahora usa check_timeouts).
+        Mantiene compatibilidad con código existente.
+        
+        Args:
+            max_age_seconds: Ignorado, usa timeout_seconds de config
+        """
+        self.check_timeouts()
+    
     def get_feature_columns(self) -> List[str]:
         """
         Retorna lista de las 74 columnas que espera el modelo.
@@ -340,36 +469,14 @@ class RealtimeWindowGenerator:
         """
         return self.get_feature_columns()
     
-    def clear_old_data(self, max_age_seconds: float = 300):
-        """
-        Limpia datos antiguos del buffer.
-        
-        Args:
-            max_age_seconds: Máxima antigüedad en segundos
-        """
-        import time
-        current_ts = time.time()
-        cutoff = current_ts - max_age_seconds
-        
-        for ip in list(self.rows_by_ip.keys()):
-            rows = self.rows_by_ip[ip]
-            # Filtrar filas recientes
-            new_rows = deque(
-                [r for r in rows if r.get('ts', 0) >= cutoff],
-                maxlen=500
-            )
-            if len(new_rows) == 0:
-                del self.rows_by_ip[ip]
-            else:
-                self.rows_by_ip[ip] = new_rows
-    
     def get_stats(self) -> Dict:
         """Retorna estadísticas"""
         return {
             **self.stats,
             'unique_ips': len(self.rows_by_ip),
             'total_rows_buffered': sum(len(rows) for rows in self.rows_by_ip.values()),
-            'recent_windows': len(self.recent_windows)
+            'recent_windows': len(self.recent_windows),
+            'pending_windows': len(self.pending_windows)
         }
 
 
